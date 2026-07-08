@@ -9,6 +9,13 @@ import {
   Play,
   Square,
 } from "lucide-react";
+import {
+  createLocalAudioTrack,
+  type LocalAudioTrack,
+  Room,
+  RoomEvent,
+  Track,
+} from "livekit-client";
 import { ActionTooltip } from "@/components/ui/action-tooltip";
 import { StrictModeToggle } from "@/components/chat/StrictModeToggle";
 import { PersonaSelector } from "@/components/chat/PersonaSelector";
@@ -16,13 +23,7 @@ import { VoiceSettings } from "@/components/chat/VoiceSettings";
 import { MobileVoiceControls } from "@/components/chat/MobileVoiceControls";
 import { MobileTextControls } from "@/components/chat/MobileTextControls";
 import { motion, AnimatePresence } from "framer-motion";
-import {
-  usePipecatClient,
-  useRTVIClientEvent,
-  VoiceVisualizer,
-} from "@pipecat-ai/client-react";
-import { RTVIEvent, TranscriptData } from "@pipecat-ai/client-js";
-import { ChatMessage, API_BASE_URL } from "@/lib/api";
+import { ChatMessage, API_BASE_URL, startVoiceMode } from "@/lib/api";
 
 import { Button } from "@/components/ui/button";
 import { useUIStore } from "@/lib/stores/useUIStore";
@@ -35,7 +36,6 @@ import { toast } from "sonner";
 import { AttachmentButton } from "./AttachmentButton";
 import { usePlatform } from "@/hooks/usePlatform";
 import { useFileProcessor } from "@/hooks/useFileProcessor";
-import { createClient } from "@/utils/supabase/client";
 
 interface InputBarProps {
   onSendMessage: (message: string, persona?: string, strictMode?: boolean) => void;
@@ -91,7 +91,9 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
   const [message, setMessage] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const currentRoomUrlRef = useRef<string | null>(null); // Ref for event handler access
+  const currentRoomNameRef = useRef<string | null>(null); // Ref for event handler access
+  const livekitRoomRef = useRef<Room | null>(null);
+  const localAudioTrackRef = useRef<LocalAudioTrack | null>(null);
   const currentBotResponseRef = useRef<string>(""); // Ref to aggregate bot sentences (filtered, for fallback)
   const currentBotLlmTextRef = useRef<string>(""); // Ref to aggregate raw LLM text (with citation markers)
   const currentUserTranscriptRef = useRef<string>(""); // Ref to aggregate user transcripts
@@ -100,7 +102,7 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
 
   // Sync ref with store value for event handler access
   useEffect(() => {
-    currentRoomUrlRef.current = currentRoomUrl;
+    currentRoomNameRef.current = currentRoomUrl;
   }, [currentRoomUrl]);
 
   useEffect(() => {
@@ -263,11 +265,124 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
     }
   }, [mode, hasInteracted]);
 
-  const client = usePipecatClient();
+  const updateRoomName = (roomName: string | null) => {
+    setCurrentRoomUrl(roomName);
+    currentRoomNameRef.current = roomName;
+  };
 
-  const updateRoomUrl = (url: string | null) => {
-    setCurrentRoomUrl(url);
-    currentRoomUrlRef.current = url;
+  const disconnectLiveKit = async () => {
+    const track = localAudioTrackRef.current;
+    localAudioTrackRef.current = null;
+    if (track) {
+      track.stop();
+      track.detach();
+    }
+
+    const room = livekitRoomRef.current;
+    livekitRoomRef.current = null;
+    if (room) {
+      room.disconnect();
+    }
+  };
+
+  const applyLiveKitMessage = (payload: any) => {
+    if (payload?.type === "bot_ready") {
+      setConnecting(false);
+      setVoiceState("listening");
+      toast.success("Voice agent ready");
+      return;
+    }
+
+    if (payload?.type === "user_started_speaking") {
+      setVoiceState("listening");
+      currentUserTranscriptRef.current = "";
+      return;
+    }
+
+    if (payload?.type === "user_transcript" && payload.text?.trim()) {
+      if (currentUserTranscriptRef.current) {
+        currentUserTranscriptRef.current += " ";
+      }
+      currentUserTranscriptRef.current += payload.text.trim();
+      return;
+    }
+
+    if (payload?.type === "bot_llm_started") {
+      setVoiceState("processing");
+      currentBotLlmTextRef.current = "";
+      currentBotResponseRef.current = "";
+      assistantMessageSentRef.current = false;
+
+      const fullUserMessage = currentUserTranscriptRef.current.trim();
+      if (fullUserMessage) {
+        onVoiceMessage?.({ role: "user", content: fullUserMessage });
+        currentUserTranscriptRef.current = "";
+      }
+      return;
+    }
+
+    if (payload?.type === "bot_llm_text" && payload.text) {
+      currentBotLlmTextRef.current += payload.text;
+      return;
+    }
+
+    if (payload?.type === "bot_started_speaking") {
+      setVoiceState("answering");
+      return;
+    }
+
+    if (payload?.type === "bot_stopped_speaking") {
+      setVoiceState("listening");
+      const rawLlmText = currentBotLlmTextRef.current.trim();
+      const transcriptText = consumeVoiceTranscript();
+
+      if (assistantMessageSentRef.current) {
+        currentBotLlmTextRef.current = "";
+        currentBotResponseRef.current = "";
+        return;
+      }
+
+      const pendingCitations = consumePendingVoiceCitations();
+      let sources = pendingCitations.length > 0 ? pendingCitations : undefined;
+      if (!sources) {
+        const hasMarkers = /\[\d+\]/.test(rawLlmText || transcriptText || "");
+        if (hasMarkers && lastVoiceCitations.length > 0) {
+          sources = lastVoiceCitations;
+        }
+      }
+
+      const content = rawLlmText || transcriptText || currentBotResponseRef.current.trim();
+      if (content) {
+        onVoiceMessage?.({ role: "assistant", content, sources });
+      }
+
+      assistantMessageSentRef.current = true;
+      currentBotLlmTextRef.current = "";
+      currentBotResponseRef.current = "";
+      return;
+    }
+
+    if (payload?.type === "citations" && Array.isArray(payload.sources)) {
+      setPendingVoiceCitations(payload.sources);
+      const state = useConversationStore.getState();
+      const lastAssistant = [...state.messages].reverse().find((m) => m.role === "assistant");
+      if (lastAssistant && (!lastAssistant.sources || lastAssistant.sources.length === 0)) {
+        state.updateMessage(lastAssistant.id, { sources: payload.sources });
+      }
+      return;
+    }
+
+    if (payload?.type === "transcript" && payload.text && !assistantMessageSentRef.current) {
+      const pendingCitations = consumePendingVoiceCitations();
+      let sources = pendingCitations.length > 0 ? pendingCitations : undefined;
+      if (!sources && /\[\d+\]/.test(payload.text) && lastVoiceCitations.length > 0) {
+        sources = lastVoiceCitations;
+      }
+      onVoiceMessage?.({ role: "assistant", content: payload.text, sources });
+      assistantMessageSentRef.current = true;
+      currentBotLlmTextRef.current = "";
+      currentBotResponseRef.current = "";
+    }
   };
 
   // Handle Spacebar PTT for V2T mode
@@ -277,7 +392,7 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
         if (e.code === "Space" && !e.repeat && !isPTTActive) {
           e.preventDefault(); // Prevent scrolling
           setIsPTTActive(true);
-          client?.enableMic(true);
+          localAudioTrackRef.current?.unmute();
         }
       };
 
@@ -285,7 +400,7 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
         if (e.code === "Space" && isPTTActive) {
           e.preventDefault();
           setIsPTTActive(false);
-          client?.enableMic(false);
+          localAudioTrackRef.current?.mute();
         }
       };
 
@@ -296,32 +411,32 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
         window.removeEventListener("keyup", handleKeyUp);
       };
     }
-  }, [mode, enableTTS, isSessionActive, isPTTActive, client]);
+  }, [mode, enableTTS, isSessionActive, isPTTActive]);
 
   // Initial Logic: If V2T mode, mute mic initially upon connection
   useEffect(() => {
-    if (isSessionActive && !isConnecting && client) {
+    if (isSessionActive && !isConnecting && localAudioTrackRef.current) {
       if (!enableTTS) {
         // V2T Mode: Start Muted (PTT only)
-        client.enableMic(false);
+        localAudioTrackRef.current.mute();
         toast.info("Hold Spacebar to talk");
       } else {
         // V2V Mode: Start Unmuted (VAD)
-        client.enableMic(true);
+        localAudioTrackRef.current.unmute();
       }
     }
-  }, [isSessionActive, isConnecting, enableTTS, client]);
+  }, [isSessionActive, isConnecting, enableTTS]);
 
-  // Handle browser/tab close - cleanup Daily room
+  // Handle browser/tab close - cleanup LiveKit room
   useEffect(() => {
     const handleBeforeUnload = () => {
-      const roomUrl = currentRoomUrlRef.current;
-      if (roomUrl && isSessionActive) {
-        console.debug("[InputBar] beforeunload - cleaning up room:", roomUrl);
+      const roomName = currentRoomNameRef.current;
+      if (roomName && isSessionActive) {
+        console.debug("[InputBar] beforeunload - cleaning up room:", roomName);
         // Use sendBeacon for reliable delivery during page unload
         navigator.sendBeacon(
           `${API_BASE_URL}/voice-mode/disconnect-beacon`,
-          JSON.stringify({ room_url: roomUrl })
+          JSON.stringify({ room_name: roomName })
         );
       }
     };
@@ -329,46 +444,6 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
     window.addEventListener("beforeunload", handleBeforeUnload);
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, [isSessionActive]);
-
-
-  useRTVIClientEvent(RTVIEvent.BotConnected, () => {
-    console.debug("[InputBar] RTVIEvent.BotConnected");
-  });
-
-  // Capture room URL when connected (for cleanup with startBotAndConnect)
-  useRTVIClientEvent(RTVIEvent.Connected, () => {
-    console.debug("[InputBar] RTVIEvent.Connected");
-    // Try to get room URL from client's transport - try multiple property paths
-    try {
-      const transport = client?.transport as any;
-      // DailyTransport exposes roomUrl via different paths depending on version
-      const roomUrl =
-        transport?.roomUrl ||
-        transport?._roomUrl ||
-        transport?.daily?.roomUrl ||
-        transport?._daily?.roomUrl ||
-        transport?.properties?.url ||
-        (typeof transport?.getRoomUrl === 'function' ? transport.getRoomUrl() : null);
-
-      console.debug("[InputBar] Transport room URL:", roomUrl);
-      console.debug("[InputBar] Transport object keys:", transport ? Object.keys(transport) : "N/A");
-
-      if (roomUrl) {
-        updateRoomUrl(roomUrl);
-      } else {
-        console.warn("[InputBar] Could not extract room URL from transport");
-      }
-    } catch (e) {
-      console.warn("[InputBar] Could not get room URL from transport:", e);
-    }
-  });
-
-  useRTVIClientEvent(RTVIEvent.BotReady, () => {
-    console.debug("[InputBar] RTVIEvent.BotReady - setting isConnecting to false");
-    setConnecting(false);
-    setVoiceState("listening"); // Start in listening state
-    toast.success("Voice agent ready");
-  });
 
   const handleStartSession = async () => {
     // If mocking
@@ -380,11 +455,6 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
         setSessionActive(true);
         toast.success("Voice agent ready (MOCK)");
       }, 1500);
-      return;
-    }
-
-    if (!client) {
-      console.debug("[InputBar] cannot join yet: Pipecat client not initialized");
       return;
     }
 
@@ -412,32 +482,64 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
         }
       }
 
-      // Use SDK's startBotAndConnect - handles client-ready/bot-ready handshake properly
-      console.debug("[InputBar] Calling startBotAndConnect...");
+      await disconnectLiveKit();
+      const session = await startVoiceMode(activeConversationId, "default", enableTTS, persona, strictMode);
+      updateRoomName(session.room_name);
 
-      // Get auth token for API request
-      const supabase = createClient();
-      const { data: { session } } = await supabase.auth.getSession();
-      const authToken = session?.access_token;
+      const room = new Room({ adaptiveStream: true, dynacast: true });
+      livekitRoomRef.current = room;
 
-      await client.startBotAndConnect({
-        endpoint: `${API_BASE_URL}/api/connect`,
-        headers: authToken ? new Headers({ Authorization: `Bearer ${authToken}` }) : undefined,
-        requestData: {
-          session_id: "default",
-			conversation_id: activeConversationId,
-          enable_tts: enableTTS,
-          persona: persona,
-          strict_mode: strictMode,
-        },
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        if (track.kind === Track.Kind.Audio) {
+          const element = track.attach();
+          element.autoplay = true;
+          element.style.display = "none";
+          document.body.appendChild(element);
+        }
       });
 
-      console.debug("[InputBar] startBotAndConnect completed successfully");
-      console.debug("[InputBar] Client state after connect:", client?.state);
+      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+        track.detach().forEach((element) => element.remove());
+      });
 
-      // Store room URL from transport for cleanup (accessed via client)
-      // Note: With startBotAndConnect, room URL is managed internally
-      // We'll extract it from the client if needed for cleanup
+      room.on(RoomEvent.DataReceived, (payload) => {
+        try {
+          const text = new TextDecoder().decode(payload);
+          applyLiveKitMessage(JSON.parse(text));
+        } catch (err) {
+          console.warn("[InputBar] Failed to parse LiveKit data message:", err);
+        }
+      });
+
+      room.on(RoomEvent.Disconnected, () => {
+        const roomName = currentRoomNameRef.current;
+        console.debug("[InputBar] LiveKit disconnected, room:", roomName);
+        if (roomName) {
+          updateRoomName(null);
+          endVoiceMode(roomName).then((result) => {
+            console.debug("[InputBar] endVoiceMode result (from LiveKit disconnected):", result);
+          });
+        }
+
+        if (isSessionActive && voiceState !== "error") {
+          setErrorMessage("Connection lost");
+          setVoiceState("error");
+          setConnecting(false);
+        } else {
+          setSessionActive(false);
+          setConnecting(false);
+          setVoiceDuration(0);
+        }
+      });
+
+      await room.connect(session.livekit_url, session.token);
+      const audioTrack = await createLocalAudioTrack();
+      localAudioTrackRef.current = audioTrack;
+      await room.localParticipant.publishTrack(audioTrack);
+
+      if (!enableTTS) {
+        audioTrack.mute();
+      }
 
       setSessionActive(true);
 
@@ -473,256 +575,27 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
   }, [mode, isSessionActive, isConnecting]);
 
   useEffect(() => {
-    // Cleanup on unmount or mode switch/mock toggle
-    if (USE_MOCK_BACKEND && mode === "voice") {
-      // Mock auto-logic removed. Now manual.
-    }
-
-    // If switching OUT of voice mode, disconnect
-    if (mode === "text" && (client || isSessionActive)) {
+    if (mode === "text" && (livekitRoomRef.current || isSessionActive)) {
       (async () => {
         try {
-          if (client) await client.disconnect();
-        } catch (err) { console.warn(err); }
+          await disconnectLiveKit();
+        } catch (err) {
+          console.warn(err);
+        }
         setSessionActive(false);
         setConnecting(false);
       })();
     }
-  }, [mode, client, isSessionActive, setSessionActive, setConnecting]);
-
-  // Debugging: log when the client object changes so we can trace readiness.
-  useEffect(() => {
-    console.debug("[InputBar] Pipecat client changed:", client);
-    if (!client) {
-      console.debug(
-        "[InputBar] Pipecat client not ready yet - UI will wait before joining rooms.",
-      );
-    } else {
-      console.debug("[InputBar] Pipecat client ready.");
-    }
-  }, [client]);
-
-  // RTVI event handlers: keep hooks usage stable, but add debug logs inside handlers.
-  useRTVIClientEvent(RTVIEvent.UserStartedSpeaking, (evt?: any) => {
-    console.debug("[InputBar] RTVIEvent.UserStartedSpeaking", evt);
-    setVoiceState("listening");
-    // Clear the user transcript aggregator for a new utterance
-    currentUserTranscriptRef.current = "";
-  });
-
-  useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, (evt?: any) => {
-    console.debug("[InputBar] RTVIEvent.BotStartedSpeaking", evt);
-    setVoiceState("answering");
-    // Note: Do NOT clear aggregator here - bot-output events with spoken:true
-    // arrive BEFORE this event fires, so we'd lose the already-aggregated text
-  });
-
-  useRTVIClientEvent(RTVIEvent.BotStoppedSpeaking, (evt?: any) => {
-    console.debug("[InputBar] RTVIEvent.BotStoppedSpeaking", evt);
-    setVoiceState("listening");
-
-    const rawLlmText = currentBotLlmTextRef.current.trim();
-    const transcriptText = consumeVoiceTranscript();
-
-    if (assistantMessageSentRef.current) {
-      currentBotLlmTextRef.current = "";
-      currentBotResponseRef.current = "";
-      return;
-    }
-
-    const pendingCitations = consumePendingVoiceCitations();
-    let sources = pendingCitations.length > 0 ? pendingCitations : undefined;
-
-    if (!sources) {
-      const hasMarkers = /\[\d+\]/.test(rawLlmText || transcriptText || "");
-      if (hasMarkers && lastVoiceCitations.length > 0) {
-        sources = lastVoiceCitations;
-      }
-    }
-
-    if (rawLlmText) {
-      console.debug("[InputBar] Sending raw LLM text with citation markers:", rawLlmText.substring(0, 100));
-      onVoiceMessage?.({ 
-        role: "assistant", 
-        content: rawLlmText,
-        sources
-      });
-    } else if (transcriptText) {
-      onVoiceMessage?.({
-        role: "assistant",
-        content: transcriptText,
-        sources
-      });
-    } else {
-      // Fallback to aggregated BotOutput if raw LLM text not available
-      const fullResponse = currentBotResponseRef.current.trim();
-      if (fullResponse) {
-        console.debug("[InputBar] Fallback: Sending filtered bot response:", fullResponse);
-        onVoiceMessage?.({ 
-          role: "assistant", 
-          content: fullResponse,
-          sources
-        });
-      }
-    }
-    
-    assistantMessageSentRef.current = true;
-    currentBotLlmTextRef.current = "";
-    currentBotResponseRef.current = "";
-  });
-
-  useRTVIClientEvent((RTVIEvent as any).Message, (data: any) => {
-    const message = data?.message || data?.data || data;
-    if (message?.type === "citations" && Array.isArray(message.sources)) {
-      console.debug("[InputBar] Received citations from RTVI:", message.sources.length);
-      setPendingVoiceCitations(message.sources);
-
-      const state = useConversationStore.getState();
-      const lastAssistant = [...state.messages]
-        .reverse()
-        .find((m) => m.role === "assistant");
-
-      if (lastAssistant && (!lastAssistant.sources || lastAssistant.sources.length === 0)) {
-        state.updateMessage(lastAssistant.id, { sources: message.sources });
-      }
-    }
-    if (message?.type === "transcript" && message.text && !assistantMessageSentRef.current) {
-      const pendingCitations = consumePendingVoiceCitations();
-      let sources = pendingCitations.length > 0 ? pendingCitations : undefined;
-      if (!sources) {
-        const hasMarkers = /\[\d+\]/.test(message.text);
-        if (hasMarkers && lastVoiceCitations.length > 0) {
-          sources = lastVoiceCitations;
-        }
-      }
-      onVoiceMessage?.({ role: "assistant", content: message.text, sources });
-      assistantMessageSentRef.current = true;
-      currentBotLlmTextRef.current = "";
-      currentBotResponseRef.current = "";
-    }
-  });
-
-  // Voice transcript handlers - capture transcripts to display in chat
-  useRTVIClientEvent(RTVIEvent.UserTranscript, (data: TranscriptData) => {
-    console.debug("[InputBar] RTVIEvent.UserTranscript:", data);
-    // Aggregate final transcripts - don't send immediately
-    // The complete message will be sent when bot starts responding
-    if (data.final && data.text && data.text.trim()) {
-      // Add space between segments if there's already content
-      if (currentUserTranscriptRef.current) {
-        currentUserTranscriptRef.current += " ";
-      }
-      currentUserTranscriptRef.current += data.text.trim();
-      console.debug("[InputBar] Aggregated user text:", currentUserTranscriptRef.current);
-    }
-  });
-
-  useRTVIClientEvent(RTVIEvent.BotLlmStarted, () => {
-    console.debug("[InputBar] RTVIEvent.BotLlmStarted");
-    setVoiceState("processing");
-    
-    // Reset LLM text aggregator for new response
-    currentBotLlmTextRef.current = "";
-    currentBotResponseRef.current = "";
-    assistantMessageSentRef.current = false;
-    
-    const fullUserMessage = currentUserTranscriptRef.current.trim();
-    if (fullUserMessage) {
-      console.debug("[InputBar] Sending aggregated user message:", fullUserMessage);
-      onVoiceMessage?.({ role: "user", content: fullUserMessage });
-      currentUserTranscriptRef.current = "";
-    }
-  });
-
-  // Capture raw LLM output (with citation markers) - this is the unfiltered text
-  useRTVIClientEvent(RTVIEvent.BotLlmText, (data: any) => {
-    const text = data?.text || data?.data?.text;
-    if (text) {
-      currentBotLlmTextRef.current += text;
-      console.debug("[InputBar] RTVIEvent.BotLlmText - aggregated raw LLM text:", currentBotLlmTextRef.current.substring(0, 100));
-    }
-  });
-
-  // Capture bot's spoken output (filtered, no markers) - used as fallback
-  useRTVIClientEvent(RTVIEvent.BotOutput, (data: any) => {
-    const text = data?.text || data?.data?.text;
-    const spoken = data?.spoken ?? data?.data?.spoken;
-
-    if (spoken && text && text.trim()) {
-      const trimmedText = text.trim();
-      if (currentBotResponseRef.current && !currentBotResponseRef.current.endsWith(" ")) {
-        currentBotResponseRef.current += " ";
-      }
-      currentBotResponseRef.current += trimmedText;
-    }
-  });
-
-  // Handle disconnection (bot left, error, or user disconnect)
-  useRTVIClientEvent(RTVIEvent.Disconnected, () => {
-    const roomUrl = currentRoomUrlRef.current;
-    console.debug("[InputBar] RTVIEvent.Disconnected - resetting session state, roomUrl:", roomUrl);
-
-    // Clean up Daily room if we have a URL (atomic check-and-clear to prevent duplicates)
-    if (roomUrl) {
-      // Clear immediately to prevent duplicate cleanup from handleDisconnect
-      updateRoomUrl(null);
-      console.debug("[InputBar] Cleaning up Daily room on disconnect event");
-      endVoiceMode(roomUrl).then(result => {
-        console.debug("[InputBar] endVoiceMode result (from Disconnected event):", result);
-      });
-    }
-
-    // If we were in an active session and it wasn't a user-initiated disconnect,
-    // show error state instead of silently closing
-    if (isSessionActive && voiceState !== "error") {
-      setErrorMessage("Connection lost");
-      setVoiceState("error");
-      setConnecting(false);
-      // Keep isSessionActive true so error UI shows
-    } else {
-      setSessionActive(false);
-      setConnecting(false);
-      setVoiceDuration(0);
-    }
-  });
-
-  // Handle connection errors from backend
-  useRTVIClientEvent(RTVIEvent.Error, (error: any) => {
-    console.error("[InputBar] RTVIEvent.Error:", error);
-
-    // Categorize error and set appropriate message
-    let message = "Connection error";
-    const errorStr = JSON.stringify(error).toLowerCase();
-
-    if (errorStr.includes("timeout") || errorStr.includes("timed out")) {
-      message = "Connection timed out";
-    } else if (errorStr.includes("network") || errorStr.includes("disconnected")) {
-      message = "Network connection lost";
-    } else if (errorStr.includes("microphone") || errorStr.includes("permission")) {
-      message = "Microphone access required";
-    } else if (errorStr.includes("rate") || errorStr.includes("limit")) {
-      message = "Too many requests";
-    } else if (errorStr.includes("service") || errorStr.includes("unavailable")) {
-      message = "Service unavailable";
-    }
-
-    setErrorMessage(message);
-    setVoiceState("error");
-    setConnecting(false);
-    // Keep session "active" so error UI shows in the voice bar
-    // User can retry or close from there
-  });
-
-
+  }, [mode, isSessionActive, setSessionActive, setConnecting]);
 
   const handleDisconnect = async () => {
-    const roomUrl = currentRoomUrlRef.current;
-    if (roomUrl) {
-      updateRoomUrl(null);
-      await endVoiceMode(roomUrl);
+    const roomName = currentRoomNameRef.current;
+    if (roomName) {
+      updateRoomName(null);
+      await endVoiceMode(roomName);
     }
     try {
-      if (client) await client.disconnect();
+      await disconnectLiveKit();
     } catch (err) {
       console.warn("[InputBar] disconnect error:", err);
     }
@@ -1009,14 +882,7 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
                     </>
                   ) : voiceState === "listening" ? (
                     <>
-                      <VoiceVisualizer
-                        participantType="local"
-                        backgroundColor="transparent"
-                        barColor="#60a5fa"
-                        barWidth={2}
-                        barGap={1}
-                        barMaxHeight={14}
-                      />
+                      <div className="w-2 h-2 rounded-full bg-blue-300 animate-pulse" />
                       <span className="text-sm font-medium">Listening..</span>
                     </>
                   ) : voiceState === "processing" ? (
@@ -1034,10 +900,10 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
                         onClick={(e) => {
                           e.stopPropagation();
                           // Clean up old room first
-                          const roomUrl = currentRoomUrlRef.current;
-                          if (roomUrl) {
-                            endVoiceMode(roomUrl);
-                            updateRoomUrl(null);
+                          const roomName = currentRoomNameRef.current;
+                          if (roomName) {
+                            endVoiceMode(roomName);
+                            updateRoomName(null);
                           }
                           // Reset state and retry
                           setVoiceState("listening");
@@ -1055,14 +921,7 @@ export function InputBar({ onSendMessage, isLoading, onStop, defaultMessage, onM
                     </>
                   ) : (
                     <>
-                      <VoiceVisualizer
-                        participantType="bot"
-                        backgroundColor="transparent"
-                        barColor="#34d399"
-                        barWidth={2}
-                        barGap={1}
-                        barMaxHeight={14}
-                      />
+                      <div className="w-2 h-2 rounded-full bg-emerald-300 animate-pulse" />
                       <span className="text-sm font-medium">Answering..</span>
                     </>
                   )}

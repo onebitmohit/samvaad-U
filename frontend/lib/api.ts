@@ -43,9 +43,10 @@ export interface ChatResponse {
 }
 
 export interface VoiceModeResponse {
-	room_url: string;
-	token: string | null;
-	session_id: string;
+	livekit_url: string;
+	room_name: string;
+	token: string;
+	conversation_id: string;
 	success: boolean;
 }
 
@@ -92,10 +93,10 @@ export const startVoiceMode = async (
 	return response.data;
 };
 
-export const endVoiceMode = async (roomUrl: string) => {
+export const endVoiceMode = async (roomName: string) => {
 	try {
 		const response = await api.post("/voice-mode/disconnect", {
-			room_url: roomUrl,
+			room_name: roomName,
 		});
 		return response.data;
 	} catch (error) {

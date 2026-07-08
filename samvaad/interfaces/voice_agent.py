@@ -1,9 +1,12 @@
 import asyncio
+import json
 import os
 import time
+import uuid
 from typing import Any, cast
 
 import aiohttp
+import jwt
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.base_task import PipelineTaskParams
@@ -13,22 +16,22 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
-from pipecat.processors.frameworks.rtvi import (
-    RTVIProcessor,
-    RTVIServerMessageFrame,
-    RTVIObserver,
-)
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    TranscriptionFrame,
+    UserStartedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.groq.llm import GroqLLMService
-from pipecat.transports.daily.transport import DailyParams, DailyTransport
+from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
+from pipecat.transports.livekit.utils import LiveKitRESTHelper
 from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 
 from samvaad.core.types import ConversationMode
@@ -40,150 +43,158 @@ from samvaad.utils.logger import logger
 from samvaad.utils.text_filters import CitationTextFilter
 
 
-class LLMTextCaptureObserver(BaseObserver):
-    def __init__(self, llm: GroqLLMService, context: SamvaadLLMContext, rtvi: RTVIProcessor) -> None:
+class LiveKitMessageObserver(BaseObserver):
+    def __init__(self, llm: GroqLLMService, context: SamvaadLLMContext, transport: LiveKitTransport) -> None:
         super().__init__()
         self._llm = llm
         self._context = context
-        self._rtvi = rtvi
+        self._transport = transport
         self._aggregated_text = ""
         self._is_aggregating = False
+
+    async def _send_message(self, payload: dict[str, Any]) -> None:
+        try:
+            await self._transport.send_message(json.dumps(payload))
+        except Exception as e:
+            logger.error(f"[LiveKitMessageObserver] Failed to send message: {e}")
 
     async def on_push_frame(self, data: FramePushed):
         if data.direction != FrameDirection.DOWNSTREAM:
             return
+
+        frame = data.frame
+        if isinstance(frame, UserStartedSpeakingFrame):
+            await self._send_message({"type": "user_started_speaking"})
+            self._context.set_pending_raw_assistant_text("")
+            return
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            await self._send_message(
+                {"type": "user_transcript", "text": frame.text.strip(), "final": True}
+            )
+            return
+        if isinstance(frame, BotStartedSpeakingFrame):
+            await self._send_message({"type": "bot_started_speaking"})
+            return
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            await self._send_message({"type": "bot_stopped_speaking"})
+            return
+
         if data.source is not self._llm:
             return
 
-        frame = data.frame
         if isinstance(frame, LLMFullResponseStartFrame):
             self._is_aggregating = True
             self._aggregated_text = ""
+            await self._send_message({"type": "bot_llm_started"})
         elif isinstance(frame, LLMTextFrame) and self._is_aggregating:
             self._aggregated_text += frame.text
+            await self._send_message({"type": "bot_llm_text", "text": frame.text})
         elif isinstance(frame, LLMFullResponseEndFrame) and self._is_aggregating:
             if self._aggregated_text.strip():
                 text = self._aggregated_text.strip()
                 self._context.set_pending_raw_assistant_text(text)
-                # Send transcript to frontend so it can display immediately
-                try:
-                    frame = RTVIServerMessageFrame(data={"type": "transcript", "text": text})
-                    await self._rtvi.push_frame(frame)
-                    logger.debug(f"[LLMTextCaptureObserver] Sent transcript to frontend: {text[:100]}...")
-                except Exception as e:
-                    logger.error(f"[LLMTextCaptureObserver] Failed to send transcript: {e}")
+                await self._send_message({"type": "transcript", "text": text})
+                logger.debug(f"[LiveKitMessageObserver] Sent transcript to frontend: {text[:100]}...")
             self._aggregated_text = ""
             self._is_aggregating = False
 
 
-async def create_daily_room() -> tuple[str, str | None]:
-    """
-    Creates a new temporary room via the Daily REST API.
-    NOT the Daily Python SDK.
-    """
-    api_key = os.getenv("DAILY_API_KEY")
+def _livekit_config() -> tuple[str, str, str]:
+    url = os.getenv("LIVEKIT_URL")
+    api_key = os.getenv("LIVEKIT_API_KEY")
+    api_secret = os.getenv("LIVEKIT_API_SECRET")
+    if not url:
+        raise ValueError("LIVEKIT_URL is not set in environment variables")
     if not api_key:
-        raise ValueError("DAILY_API_KEY is not set in environment variables")
-    assert isinstance(api_key, str)
+        raise ValueError("LIVEKIT_API_KEY is not set in environment variables")
+    if not api_secret:
+        raise ValueError("LIVEKIT_API_SECRET is not set in environment variables")
+    return url, api_key, api_secret
 
-    api_url = "https://api.daily.co/v1/rooms"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    expiration_time = int(time.time()) + 3600
-
-    # Create a room that expires in 1 hour to keep your account clean
-    # [SECURITY-FIX #84] Force private room to prevent eavesdropping
-    payload = {
-        "privacy": "private",
-        "properties": {
-            "exp": expiration_time,
-            "enable_chat": False,
-            "start_video_off": True,
-            "permissions": {"canSend": ["audio"]},
+def _create_livekit_token(
+    *,
+    api_key: str,
+    api_secret: str,
+    identity: str,
+    room_name: str,
+    room_create: bool = False,
+) -> str:
+    now = int(time.time())
+    claims = {
+        "iss": api_key,
+        "sub": identity,
+        "nbf": now,
+        "exp": now + 3600,
+        "video": {
+            "room": room_name,
+            "roomJoin": True,
+            "roomCreate": room_create,
+            "canPublish": True,
+            "canSubscribe": True,
+            "canPublishData": True,
         },
     }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(api_url, headers=headers, json=payload) as response:
-            if response.status != 200:
-                text = await response.text()
-                raise Exception(f"Failed to create room: {text}")
-
-            data = await response.json()
-
-            # [SECURITY-FIX #84] Now that room is private, we MUST generate a token for the owner
-            # The 'token' field in room creation response might be None if not requested or different API.
-            # Best practice: Explicitly create a meeting token for the user.
-
-            # Actually, Daily's room creation response usually doesn't include a token unless requested?
-            # Wait, the previous code expected `data.get("token")`.
-            # If the room is private, we need a token to join.
-            # Let's create a meeting token explicitly.
-
-            owner_token_url = "https://api.daily.co/v1/meeting-tokens"
-            token_payload = {
-                "properties": {
-                    "room_name": data["name"],
-                    "is_owner": True,
-                    "exp": expiration_time,
-                }
-            }
-
-            async with session.post(owner_token_url, headers=headers, json=token_payload) as token_res:
-                if token_res.status != 200:
-                    # Fallback? If token fails, user can't join private room.
-                    token_text = await token_res.text()
-                    raise Exception(f"Room created but token generation failed: {token_text}")
-
-                token_data = await token_res.json()
-                return data["url"], token_data["token"]
+    return jwt.encode(claims, api_secret, algorithm="HS256")
 
 
-async def delete_daily_room(room_url: str) -> bool:
-    """
-    Delete a Daily room to save minutes.
-    Extracts room name from URL and calls DELETE on Daily API.
-    """
-    api_key = os.getenv("DAILY_API_KEY")
-    if not api_key:
-        logger.warning("DAILY_API_KEY not set, cannot delete room")
-        return False
+async def create_livekit_room(user_id: str | None = None) -> tuple[str, str, str, str]:
+    """Create a temporary LiveKit room name and signed user/bot access tokens."""
+    url, api_key, api_secret = _livekit_config()
+    room_name = f"samvaad-{uuid.uuid4().hex}"
+    user_identity = f"user-{user_id or uuid.uuid4().hex}"
+    user_token = _create_livekit_token(
+        api_key=api_key,
+        api_secret=api_secret,
+        identity=user_identity,
+        room_name=room_name,
+    )
+    bot_token = _create_livekit_token(
+        api_key=api_key,
+        api_secret=api_secret,
+        identity=f"samvaad-bot-{uuid.uuid4().hex[:8]}",
+        room_name=room_name,
+        room_create=True,
+    )
+    return url, room_name, user_token, bot_token
 
-    # Extract room name from URL (e.g., https://samvaad.daily.co/abc123 -> abc123)
-    room_name = room_url.rstrip("/").split("/")[-1]
+
+async def delete_livekit_room(room_name: str) -> bool:
+    """Delete a LiveKit room if the server supports the RoomService API."""
     if not room_name:
-        logger.warning(f"Could not extract room name from URL: {room_url}")
+        logger.warning("No LiveKit room name provided for cleanup")
         return False
 
-    api_url = f"https://api.daily.co/v1/rooms/{room_name}"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    url, api_key, api_secret = _livekit_config()
+    api_url = url.replace("ws://", "http://").replace("wss://", "https://")
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.delete(api_url, headers=headers) as response:
-                if response.status in (200, 204, 404):
-                    # 200/204 = deleted, 404 = already gone
-                    logger.info(f"Daily room {room_name} deleted successfully")
-                    return True
-                else:
-                    text = await response.text()
-                    logger.warning(f"Failed to delete Daily room: {text}")
-                    return False
+            helper = LiveKitRESTHelper(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_url=api_url,
+                aiohttp_session=session,
+            )
+            await helper.delete_room_by_name(room_name)
+            logger.info(f"LiveKit room {room_name} deleted successfully")
+            return True
     except Exception as e:
-        logger.error(f"Error deleting Daily room: {e}")
+        logger.warning(f"Error deleting LiveKit room {room_name}: {e}")
         return False
 
 
 async def start_voice_agent(
-    room_url: str,
-    token: str | None,
+    livekit_url: str,
+    room_name: str,
+    token: str,
     user_id: str,
     conversation_id: str,
     enable_tts: bool = True,
     persona: str = "default",
     strict_mode: bool = False,
 ):
-    """Entry point to start the bot in a specific Daily room"""
+    """Entry point to start the bot in a specific LiveKit room."""
 
     deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
     if not deepgram_api_key:
@@ -200,20 +211,16 @@ async def start_voice_agent(
     #                  (higher value = fewer splits but slower response time)
     # - min_volume=0.7: Filter out quiet background noise
     vad_analyzer = SileroVADAnalyzer(params=VADParams(confidence=0.8, start_secs=0.5, stop_secs=1.0, min_volume=0.7))
-    transport = DailyTransport(
-        room_url=room_url,
+    transport = LiveKitTransport(
+        url=livekit_url,
+        room_name=room_name,
         token=token,
-        bot_name="Samvaad",
-        params=DailyParams(
+        params=LiveKitParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            camera_out_enabled=False,
             vad_analyzer=vad_analyzer,
         ),
     )
-
-    # 2. Create RTVI processor early (needed by fetch_context for citations)
-    rtvi = RTVIProcessor()
 
     # 3. Define Tools (The RAG Integration)
     RAG_TIMEOUT_SECONDS = 10.0
@@ -277,12 +284,10 @@ async def start_voice_agent(
             rag_text = "An error occurred while searching. Please try again."
             sources = []
 
-        # Send citations to frontend via RTVI custom message
+        # Send citations to frontend via LiveKit data message.
         if sources:
             try:
-                frame = RTVIServerMessageFrame(data={"type": "citations", "sources": sources})
-
-                await rtvi.push_frame(frame)
+                await transport.send_message(json.dumps({"type": "citations", "sources": sources}))
                 logger.debug(f"[voice_agent] Sent {len(sources)} citations to frontend")
             except Exception as e:
                 logger.error(f"[voice_agent] Failed to send citations: {e}")
@@ -349,13 +354,8 @@ async def start_voice_agent(
     )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
 
-    # 6. The Pipeline (Data Flow)
-    # RTVIProcessor handles RTVI protocol messages (BotReady, user/bot speaking, etc.)
-    # (rtvi already created earlier for fetch_context access)
-
     processors = [
         transport.input(),
-        rtvi,
         stt,
         user_aggregator,
         llm,
@@ -376,35 +376,6 @@ async def start_voice_agent(
 
     pipeline = Pipeline(processors)
 
-    # 6. RTVI Event Handler - Send bot-ready when client is ready
-    # Track if transport has joined to avoid timing race
-    transport_joined = False
-
-    @transport.event_handler("on_joined")
-    async def on_joined(transport_obj, participant):
-        nonlocal transport_joined
-        transport_joined = True
-        # Safe access - participant may be dict without 'id' or a different type
-        if isinstance(participant, dict):
-            participant_id = participant.get("id", participant.get("session_id", "unknown"))
-        else:
-            participant_id = str(participant)
-        logger.info(f"[voice_agent] Successfully joined room as: {participant_id}")
-
-    @rtvi.event_handler("on_client_ready")
-    async def on_client_ready(rtvi_processor):
-        nonlocal transport_joined
-        # Wait for transport to join before sending bot-ready
-        if not transport_joined:
-            logger.info("[voice_agent] Client ready but transport not joined yet, waiting...")
-            # Wait up to 5 seconds for transport to join
-            for _ in range(50):
-                await asyncio.sleep(0.1)
-                if transport_joined:
-                    break
-        logger.info("[voice_agent] Client ready - sending bot-ready")
-        await rtvi_processor.set_bot_ready()
-
     # Cleanup flag to prevent duplicate cleanup (both events can fire)
     cleanup_done = False
 
@@ -415,29 +386,18 @@ async def start_voice_agent(
             return
         cleanup_done = True
         logger.info(f"[voice_agent] Cleaning up - {reason}")
-        await delete_daily_room(room_url)
+        await delete_livekit_room(room_name)
         await task.cancel()
 
-    # 7. Handle participant leaving - cleanup room
-    @transport.event_handler("on_participant_left")
-    async def on_participant_left(transport_obj, participant, reason):
-        logger.info(f"[voice_agent] Participant left: {participant['id']}, reason: {reason}")
-        await do_cleanup("participant_left")
+    @transport.event_handler("on_connected")
+    async def on_connected(transport_obj):
+        logger.info(f"[voice_agent] Connected to LiveKit room: {room_name}")
+        await transport.send_message(json.dumps({"type": "bot_ready"}))
 
-    # 8. Handle client disconnection (browser close, etc.)
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport_obj, client):
-        logger.info("[voice_agent] Client disconnected")
-        await do_cleanup("client_disconnected")
-
-    # 9. Handle transport errors explicitly - trigger cleanup on failure
-    # Note: rtvi.send_error() can't work before transport joins, so we
-    # rely on the frontend's 30-second timeout to detect connection failure
-    @transport.event_handler("on_error")
-    async def on_transport_error(transport_obj, error):
-        logger.error(f"[voice_agent] Transport error: {error}")
-        # Trigger cleanup to allow frontend timeout to detect failure
-        await do_cleanup("transport_error")
+    @transport.event_handler("on_participant_disconnected")
+    async def on_participant_disconnected(transport_obj, participant_id):
+        logger.info(f"[voice_agent] Participant disconnected: {participant_id}")
+        await do_cleanup("participant_disconnected")
 
     # 9. Run the pipeline with 60-second idle timeout
     pipeline_params = PipelineParams(
@@ -447,7 +407,7 @@ async def start_voice_agent(
     task = PipelineTask(
         pipeline,
         params=pipeline_params,
-        observers=[RTVIObserver(rtvi), LLMTextCaptureObserver(llm, context, rtvi)],
+        observers=[LiveKitMessageObserver(llm, context, transport)],
         idle_timeout_secs=60,
         cancel_on_idle_timeout=True,
     )

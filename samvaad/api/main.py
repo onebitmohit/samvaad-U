@@ -34,7 +34,7 @@ from slowapi.util import get_remote_address
 from samvaad.api.deps import get_current_user
 from samvaad.api.routers import conversations, files, users
 from samvaad.db.models import User
-from samvaad.interfaces.voice_agent import create_daily_room, start_voice_agent
+from samvaad.interfaces.voice_agent import create_livekit_room, start_voice_agent
 from samvaad.pipeline.ingestion.ingestion import ingest_file_pipeline
 from samvaad.utils.clean_markdown import strip_markdown
 from samvaad.utils.logger import logger
@@ -229,7 +229,7 @@ class VoiceModeRequest(BaseModel):
 
 
 class VoiceDisconnectRequest(BaseModel):
-    room_url: str
+    room_name: str
 
 
 class TTSRequest(BaseModel):
@@ -408,48 +408,51 @@ active_voice_tasks: set = set()
 
 
 async def _run_voice_agent_wrapper(
-    room_url: str,
-    token: str | None,
+    livekit_url: str,
+    room_name: str,
+    token: str,
     user_id: str,
     conversation_id: str,
     **kwargs,
 ):
     """Wrapper to run voice agent safely in background."""
     try:
-        logger.info(f"[VoiceAgent] Starting agent for room {room_url} (user {user_id})")
+        logger.info(f"[VoiceAgent] Starting agent for LiveKit room {room_name} (user {user_id})")
         await start_voice_agent(
-            room_url,
+            livekit_url,
+            room_name,
             token,
             user_id=user_id,
             conversation_id=conversation_id,
             **kwargs,
         )
-        logger.info(f"[VoiceAgent] Agent finished successfully for room {room_url}")
+        logger.info(f"[VoiceAgent] Agent finished successfully for LiveKit room {room_name}")
     except asyncio.CancelledError:
-        logger.info(f"[VoiceAgent] Agent task cancelled for room {room_url}")
+        logger.info(f"[VoiceAgent] Agent task cancelled for LiveKit room {room_name}")
     except Exception as e:
         import traceback
 
-        logger.error(f"[VoiceAgent] ERROR: Agent failed for room {room_url}: {e}")
+        logger.error(f"[VoiceAgent] ERROR: Agent failed for LiveKit room {room_name}: {e}")
         logger.error(traceback.format_exc())
 
 
 async def _create_voice_session(
     request: VoiceModeRequest,
     user_id: str,
-) -> tuple[str, str | None, str]:
+) -> tuple[str, str, str, str]:
     """
-    Create Daily room and start voice agent.
-    Returns (room_url, token, conversation_id).
+    Create LiveKit room credentials and start voice agent.
+    Returns (livekit_url, room_name, user_token, conversation_id).
     """
-    room_url, token = await create_daily_room()
+    livekit_url, room_name, user_token, bot_token = await create_livekit_room(user_id=user_id)
     conversation_id = request.conversation_id
 
     # Create and track the background task
     task = asyncio.create_task(
         _run_voice_agent_wrapper(
-            room_url,
-            token,
+            livekit_url,
+            room_name,
+            bot_token,
             user_id=user_id,
             conversation_id=conversation_id,
             enable_tts=request.enable_tts,
@@ -460,7 +463,7 @@ async def _create_voice_session(
     active_voice_tasks.add(task)
     task.add_done_callback(active_voice_tasks.discard)
 
-    return room_url, token, conversation_id
+    return livekit_url, room_name, user_token, conversation_id
 
 
 @app.post("/voice-mode")
@@ -469,16 +472,17 @@ async def voice_mode(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Create a Daily room and start the voice agent for real-time voice conversation.
-    Returns room_url, token, session_id, conversation_id.
+    Create a LiveKit room and start the voice agent for real-time voice conversation.
+    Returns livekit_url, room_name, token, conversation_id.
     """
     try:
-        room_url, token, conversation_id = await _create_voice_session(
+        livekit_url, room_name, token, conversation_id = await _create_voice_session(
             request,
             user_id=current_user.id,
         )
         return {
-            "room_url": room_url,
+            "livekit_url": livekit_url,
+            "room_name": room_name,
             "token": token,
             "conversation_id": conversation_id,
             "success": True,
@@ -494,12 +498,11 @@ async def api_connect(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Create Daily room for PipecatClient.startBotAndConnect().
-    Returns {url, token} format expected by the SDK.
+    Create LiveKit room credentials.
     """
     try:
-        room_url, token, _ = await _create_voice_session(request, user_id=current_user.id)
-        return {"url": room_url, "token": token}
+        livekit_url, room_name, token, _ = await _create_voice_session(request, user_id=current_user.id)
+        return {"url": livekit_url, "room_name": room_name, "token": token}
     except Exception as e:
         logger.error(f"Error in /api/connect: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to connect: {str(e)}") from e
@@ -510,11 +513,11 @@ async def voice_disconnect(
     request: VoiceDisconnectRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """Delete the Daily room when user ends voice session."""
-    from samvaad.interfaces.voice_agent import delete_daily_room
+    """Delete the LiveKit room when user ends voice session."""
+    from samvaad.interfaces.voice_agent import delete_livekit_room
 
     try:
-        success = await delete_daily_room(request.room_url)
+        success = await delete_livekit_room(request.room_name)
         return {"success": success}
     except Exception as e:
         logger.error(f"Error disconnecting voice mode: {e}")
@@ -524,23 +527,23 @@ async def voice_disconnect(
 @app.post("/voice-mode/disconnect-beacon")
 async def voice_disconnect_beacon(request: Request):
     """
-    Delete Daily room via sendBeacon (browser close/tab close).
+    Delete LiveKit room via sendBeacon (browser close/tab close).
 
-    Note: No auth required - room URL acts as capability token since
+    Note: No auth required - room name acts as capability token since
     browser sendBeacon cannot easily attach auth headers.
     """
-    from samvaad.interfaces.voice_agent import delete_daily_room
+    from samvaad.interfaces.voice_agent import delete_livekit_room
 
     try:
         body = await request.body()
         data = json.loads(body.decode("utf-8"))
-        room_url = data.get("room_url")
+        room_name = data.get("room_name")
 
-        if not room_url:
-            return {"success": False, "error": "No room_url provided"}
+        if not room_name:
+            return {"success": False, "error": "No room_name provided"}
 
-        logger.info(f"[beacon] Cleaning up room: {room_url}")
-        success = await delete_daily_room(room_url)
+        logger.info(f"[beacon] Cleaning up room: {room_name}")
+        success = await delete_livekit_room(room_name)
         return {"success": success}
     except Exception as e:
         logger.error(f"Error in beacon disconnect: {e}")

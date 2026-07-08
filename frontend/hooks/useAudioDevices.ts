@@ -1,10 +1,9 @@
-import { usePipecatClientMediaDevices } from "@pipecat-ai/client-react";
 import { useEffect, useState } from "react";
 
 interface AudioDevices {
 	mics: MediaDeviceInfo[];
 	speakers: MediaDeviceInfo[];
-	selectedMic: any; // SDK returns OptionalMediaDeviceInfo which is compatible
+	selectedMic: MediaDeviceInfo | null;
 	selectedSpeakerId: string;
 	updateMic: (deviceId: string) => void;
 	setSelectedSpeakerId: (deviceId: string) => void;
@@ -15,10 +14,9 @@ interface AudioDevices {
  * Centralizes device management logic used across voice settings components.
  */
 export function useAudioDevices(): AudioDevices {
-	const { selectedMic, updateMic } = usePipecatClientMediaDevices();
-
 	const [speakers, setSpeakers] = useState<MediaDeviceInfo[]>([]);
 	const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
+	const [selectedMicId, setSelectedMicId] = useState<string>("");
 	const [selectedSpeakerId, setSelectedSpeakerId] = useState<string>("");
 
 	useEffect(() => {
@@ -41,6 +39,9 @@ export function useAudioDevices(): AudioDevices {
 				setMics(audioInputs);
 				setSpeakers(audioOutputs);
 
+				if (!selectedMicId && audioInputs.length > 0) {
+					setSelectedMicId(audioInputs[0].deviceId);
+				}
 				if (!selectedSpeakerId && audioOutputs.length > 0) {
 					setSelectedSpeakerId(audioOutputs[0].deviceId);
 				}
@@ -56,14 +57,14 @@ export function useAudioDevices(): AudioDevices {
 				"devicechange",
 				enumerateDevices,
 			);
-	}, [selectedSpeakerId]);
+	}, [selectedMicId, selectedSpeakerId]);
 
 	return {
 		mics,
 		speakers,
-		selectedMic,
+		selectedMic: mics.find((mic) => mic.deviceId === selectedMicId) ?? null,
 		selectedSpeakerId,
-		updateMic,
+		updateMic: setSelectedMicId,
 		setSelectedSpeakerId,
 	};
 }
